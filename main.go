@@ -7,9 +7,15 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	COUNTRY_COL int = iota
+	CODE_COL
 )
 
 var nw int
@@ -41,33 +47,37 @@ func main() {
 	}(&wg, ch)
 
 	// print channel results
-	processors := 200
+	proc := runtime.NumCPU()
 	var wg2 sync.WaitGroup
-	wg2.Add(processors)
-	counter := make(chan int)
-	for i := 0; i < processors; i++ {
-		go func(w int, wg *sync.WaitGroup, raw <-chan []string, c chan<- int) {
+	wg2.Add(proc)
+	output := make(chan []string)
+	for i := 0; i < proc; i++ {
+		go func(w int, wg *sync.WaitGroup, raw <-chan []string, o chan<- []string) {
 			defer wg.Done()
-			var j int
-			for range raw {
+			for rec := range raw {
 				// process records sent from files
-				j++
-				fmt.Printf("%d processed %d\n", w, j)
+				o <- rec
 			}
-			c <- j
-		}(i, &wg2, ch, counter)
+		}(i, &wg2, ch, output)
 	}
 	go func() {
 		wg2.Wait()
 		fmt.Println("All processor goroutines finished")
-		close(counter)
+		close(output)
 	}()
-	var records int
-	for count := range counter {
-		records += count
-	}
 
-	log.Printf("Time since start: %s, processed records %d", time.Since(start), records)
+	var wg3 sync.WaitGroup
+	outF, err := os.Create("output.csv")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer outF.Close()
+	w := csv.NewWriter(outF)
+	wg3.Add(1)
+	go writeToFile(&wg3, output, w)
+	wg3.Wait()
+
+	log.Printf("Time since start: %s, processed records", time.Since(start))
 }
 
 //	func processData(i int, r []string) {
@@ -94,16 +104,42 @@ func processFile(idx int, file string, wg *sync.WaitGroup, ch chan<- []string) {
 			}
 			log.Fatal(err)
 		}
-		if !(strings.TrimSpace(r[1]) == "") {
+		if !(strings.TrimSpace(r[CODE_COL]) == "") {
 			ch <- r
 		}
 	}
 	fmt.Println("Done processing file ", idx+1)
 }
 
-func processRecord(w int, ch <-chan []string, wg *sync.WaitGroup) {
+// the final function of the pipeline that writes records to a file
+// if the record for that country has not already been written
+func writeToFile(wg *sync.WaitGroup, ch <-chan []string, w *csv.Writer) {
 	defer wg.Done()
-	// process a record
-	for range ch {
+	records := make(map[string]struct{})
+	var j int
+	for record := range ch {
+		j++
+		if uniqueRecords(records, record) {
+			writeRecord(w, record)
+		}
+	}
+	log.Printf("Final processor did %d records", j)
+	w.Flush()
+}
+
+// maintain unique set of records based on country
+func uniqueRecords(records map[string]struct{}, record []string) bool {
+	_, ok := records[record[COUNTRY_COL]]
+	if !ok {
+		records[record[COUNTRY_COL]] = struct{}{}
+		return true
+	}
+	return false
+}
+
+// write record
+func writeRecord(w *csv.Writer, record []string) {
+	if err := w.Write(record); err != nil {
+		log.Fatal(err)
 	}
 }
